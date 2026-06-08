@@ -1,0 +1,138 @@
+# DocuX Helm values. 서비스명은 고정(api는 LLM/DB를 DNS 단축명으로 호출 — config와 일치).
+# 이미지 repository는 **전체 경로**로 둔다(사내 레지스트리 prefix 포함). 예:
+#   harbor.corp.local/docux/docux-api
+
+global:
+  # 모든 파드에 적용할 imagePullSecrets(사설 레지스트리).
+  imagePullSecrets: []
+    # - name: regcred
+
+# ── 시크릿: 외부에서 생성한 Secret을 참조(권장). 키: JWT_SECRET, DATABASE_URL,
+#    NEO4J_PASSWORD, POSTGRES_PASSWORD. (deploy/README.md의 kubectl create secret 참고)
+secret:
+  existingSecret: docux-secret
+
+# ── 비민감 설정(ConfigMap docux-config로 렌더). backend 토글 안 켜면 인메모리 빈 동작.
+config:
+  VECTOR_BACKEND: opensearch
+  SEARCH_BACKEND: opensearch
+  GRAPH_BACKEND: neo4j
+  EMBEDDER_BACKEND: sentence_transformers
+  LLM_BACKEND: openai_compat
+  NEO4J_URI: bolt://neo4j:7687
+  NEO4J_USER: neo4j
+  OPENSEARCH_URL: http://opensearch:9200
+  LLM_BASE_URL: http://llm-svc:8001/v1
+  LLM_MODEL_NAME: gemma
+  OPENSEARCH_INDEX: kms-files
+  OPENSEARCH_CHUNK_INDEX: kms-chunks
+  EMBEDDING_MODEL_NAME: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+
+# ── 백엔드 API ──
+api:
+  image:
+    repository: docux-api
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  # DB 마이그레이션 Job(alembic upgrade head) — API 기동 전 1회.
+  migrate:
+    enabled: true
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits:   { memory: "3Gi" }
+  persistence:
+    # 문서 비교 페이지 프리뷰 원본(/app/data).
+    data:
+      size: 20Gi
+      accessMode: ReadWriteOnce
+      storageClass: ""
+    # HF 임베딩·리랭커 모델 캐시.
+    hfcache:
+      size: 5Gi
+      accessMode: ReadWriteOnce
+      storageClass: ""
+
+# ── 프론트엔드(nginx 정적 SPA) ──
+frontend:
+  image:
+    repository: docux-frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 2
+  # nginx가 /v1 프록시할 백엔드(클러스터 내부 API 서비스).
+  backendUrl: http://docux-api:8000
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits:   { memory: "128Mi" }
+
+# ── LLM 추론 서버(llama.cpp CUDA, GPU 노드) ──
+llm:
+  enabled: true
+  image:
+    repository: docux-llm
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  gpu: 1                       # nvidia.com/gpu 요청 수 → GPU 노드 스케줄
+  nGpuLayers: -1              # -1=전 레이어 GPU(VRAM 충분 시)
+  ctxSize: 8192
+  model:
+    path: /models/gemma-e4b-Q4_K_M.gguf
+    alias: gemma
+    fetchUrl: ""              # 설정 시 initContainer가 PVC로 모델 다운로드
+  persistence:
+    size: 20Gi
+    accessMode: ReadOnlyMany  # 다중 replica 공유 읽기(미지원 스토리지면 ReadWriteOnce+replicas:1)
+    storageClass: ""
+  resources:
+    requests: { cpu: "2", memory: "6Gi" }
+    limits:   { memory: "8Gi" }
+  # GPU 노드 선택/허용 — 사내 라벨·taint로 교체.
+  nodeSelector: {}
+    # gpu-node-label-key: "value"
+  tolerations: []
+    # - key: nvidia.com/gpu
+    #   operator: Exists
+    #   effect: NoSchedule
+
+# ── 데이터스토어(매니지드 DB 사용 시 enabled:false + config/secret로 외부 지정) ──
+postgres:
+  enabled: true
+  image: { repository: postgres, tag: 16-alpine }
+  storage: { size: 10Gi, storageClass: "" }
+  resources:
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits:   { memory: "1Gi" }
+
+neo4j:
+  enabled: true
+  image: { repository: neo4j, tag: 5-community }
+  storage: { size: 10Gi, storageClass: "" }
+  resources:
+    requests: { cpu: "250m", memory: "1Gi" }
+    limits:   { memory: "2Gi" }
+
+opensearch:
+  enabled: true
+  # ⚠ Dockerfile.opensearch(analysis-nori 포함) 빌드본의 전체 경로로 교체.
+  image: { repository: docux-opensearch, tag: "2.19.0" }
+  storage: { size: 20Gi, storageClass: "" }
+  javaOpts: "-Xms1g -Xmx1g"
+  # 노드 sysctl(vm.max_map_count) 미설정 시 privileged initContainer로 올린다.
+  setSysctl: true
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits:   { memory: "3Gi" }
+
+# ── 외부 진입(Ingress) — 프론트로 라우팅, nginx가 /v1 프록시 ──
+ingress:
+  enabled: false
+  className: ""              # 예: nginx
+  host: docux.example.com
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+  tls: []
+    # - secretName: docux-tls
+    #   hosts: [docux.example.com]
